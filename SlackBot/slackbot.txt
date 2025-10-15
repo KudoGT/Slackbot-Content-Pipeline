@@ -1,0 +1,137 @@
+# backend/slackbot.py
+import os
+import logging
+import requests
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+from dotenv import load_dotenv
+from utils.cleaning import clean_keywords
+from utils.grouping import group_keywords
+from backend.outline import generate_outline_for_group
+from backend.post_idea import generate_post_idea_for_group
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
+SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
+
+app = App(token=SLACK_BOT_TOKEN)
+
+# Track users awaiting CSV upload
+pending_csv_users = {}
+
+# --- CSV parsing helper ---
+def parse_csv(csv_string):
+    from io import StringIO
+    import csv
+    f = StringIO(csv_string)
+    reader = csv.reader(f)
+    return [row[0].strip() for row in reader if row and row[0].strip()]
+
+# --- Slash command handler ---
+@app.command("/generate-content")
+def handle_generate_content(ack, body, say):
+    ack()
+    user_id = body["user_id"]
+    channel_id = body["channel_id"]
+    text = body.get("text", "").strip()
+
+    if text.lower() == "csv":
+        pending_csv_users[user_id] = channel_id
+        say(f"👋 Hi <@{user_id}>, please upload your CSV file in this channel.")
+        return
+
+    # Manual keyword input
+    keywords = [kw.strip() for kw in text.replace(",", "\n").split("\n") if kw.strip()]
+    if not keywords:
+        say("❌ No keywords detected. Please provide some keywords.")
+        return
+
+    say(":gear: Generating content ideas, please wait… :hourglass_flowing_sand:")
+    send_pipeline_results(say, keywords, user_id)
+
+# --- Handle uploaded CSV files ---
+@app.event("message")
+def handle_file_upload(event, say):
+    user_id = event.get("user")
+    channel_id = event.get("channel")
+    files = event.get("files", [])
+
+    if user_id not in pending_csv_users or channel_id != pending_csv_users[user_id]:
+        return
+
+    if not files:
+        say(f"❌ <@{user_id}>, no file detected. Please attach a CSV file.")
+        return
+
+    file_info = files[0]
+    if file_info.get("filetype") != "csv":
+        say(f"❌ <@{user_id}>, please upload a CSV file.")
+        return
+
+    file_url = file_info.get("url_private_download")
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    response = requests.get(file_url, headers=headers)
+    if response.status_code != 200:
+        say(f"❌ <@{user_id}>, failed to download the CSV file.")
+        logger.error(f"Failed to download CSV, status code {response.status_code}")
+        return
+
+    keywords = parse_csv(response.text)
+    if not keywords:
+        say(f"❌ <@{user_id}>, no keywords found in CSV.")
+        return
+
+    del pending_csv_users[user_id]
+
+    say(":gear: Generating content ideas, please wait… :hourglass_flowing_sand:")
+    send_pipeline_results(say, keywords, user_id)
+
+# --- Processing pipeline: clean → group → outline → post idea ---
+def send_pipeline_results(respond_fn, keywords, user_id):
+    cleaned_keywords = clean_keywords(keywords)
+    if not cleaned_keywords:
+        respond_fn(f"❌ <@{user_id}>, no valid keywords after cleaning.")
+        return
+
+    groups = group_keywords(cleaned_keywords)
+    if not groups:
+        respond_fn(f"❌ <@{user_id}>, failed to group keywords. Try more diverse keywords.")
+        return
+
+    results = []
+    for i, (group_id, kw_list) in enumerate(groups.items(), 1):
+        outline = generate_outline_for_group(kw_list)
+        post_idea = generate_post_idea_for_group(kw_list, outline)
+        results.append({
+            "group": i,
+            "keywords": kw_list,
+            "outline": outline,
+            "post_idea": post_idea
+        })
+
+    blocks = []
+    for item in results:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*Group {item['group']}*\n"
+                    f"*Keywords:* {', '.join(item['keywords'])}\n"
+                    f"*Post Idea:* {item['post_idea']}\n"
+                    f"*Outline:*\n{item['outline']}"
+                )
+            }
+        })
+
+    respond_fn(blocks=blocks)
+    respond_fn(f"✅ <@{user_id}>, your content generation is complete!")
+
+# --- Run Slackbot ---
+if __name__ == "__main__":
+    logger.info("⚡️ Starting Slack Bolt app in Socket Mode...")
+    SocketModeHandler(app, SLACK_APP_TOKEN).start()
